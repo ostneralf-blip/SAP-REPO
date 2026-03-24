@@ -4,8 +4,8 @@ CLASS ztc_tariff_jump_analysis_v2 DEFINITION FINAL FOR TESTING
   DURATION SHORT.
 
   PRIVATE SECTION.
-    "! OSQL test environment providing doubles for the underlying base tables.
-    "! Declared class-level so it is shared across all test methods.
+    "! OSQL test environment providing doubles for the CDS views and table
+    "! consumed by Z_I_TariffJumpBase_V2 (and thus Z_I_TariffJumpAnalysis_V2).
     CLASS-DATA go_env TYPE REF TO if_osql_test_environment.
 
     CLASS-METHODS:
@@ -17,17 +17,36 @@ CLASS ztc_tariff_jump_analysis_v2 DEFINITION FINAL FOR TESTING
     METHODS:
       "! Clear test-double tables before each test method.
       setup,
+
+      "--------------------------------------------------------------------
+      " Helper: insert one self-consistent BOM test scenario.
+      "   iv_bom_id   – unique BOM number (padded, e.g. '00000001')
+      "   iv_fp_mat   – finished-product material number
+      "   iv_comp_mat – component material number
+      "   iv_plant    – plant
+      "   iv_fp_stawn – commodity code for FP  (MARC.STAWN, CHAR 9, may be '')
+      "   iv_co_stawn – commodity code for Comp(MARC.STAWN, CHAR 9, may be '')
+      "--------------------------------------------------------------------
+      _insert_bom_scenario
+        IMPORTING
+          iv_bom_id   TYPE c
+          iv_fp_mat   TYPE c
+          iv_comp_mat TYPE c
+          iv_plant    TYPE c
+          iv_fp_stawn TYPE c DEFAULT ''
+          iv_co_stawn TYPE c DEFAULT '',
+
       "! Finished product and component share the same HS heading → no jump.
-      test_no_jump_at_heading       FOR TESTING,
+      test_no_jump_at_heading           FOR TESTING,
       "! Finished product and component have different HS headings → jump detected.
-      test_jump_at_heading          FOR TESTING,
+      test_jump_at_heading              FOR TESTING,
       "! Finished product and component share the same HS chapter → no jump.
-      test_no_jump_at_chapter       FOR TESTING,
+      test_no_jump_at_chapter           FOR TESTING,
       "! Finished product and component have different HS chapters → jump detected.
-      test_jump_at_chapter          FOR TESTING,
-      "! Both commodity codes are empty → no jump should be flagged.
-      test_empty_commodity_codes    FOR TESTING,
-      "! Heading jump does NOT imply chapter jump (same chapter, diff heading).
+      test_jump_at_chapter              FOR TESTING,
+      "! Both STAWN fields are blank → substrings equal '' = '' → no jump.
+      test_empty_commodity_codes        FOR TESTING,
+      "! Same chapter (84) but different heading → heading 'X', chapter ''.
       test_heading_jump_no_chapter_jump FOR TESTING.
 
 ENDCLASS.
@@ -36,15 +55,19 @@ ENDCLASS.
 CLASS ztc_tariff_jump_analysis_v2 IMPLEMENTATION.
 
   METHOD class_setup.
-    "  The test environment doubles the base tables read by Z_I_TariffJumpBase_V2.
-    "  List every table / CDS view that is accessed by the dependency chain.
+    "  Double every entity in the dependency chain of Z_I_TariffJumpBase_V2:
+    "    I_BILLOFMATERIALITEM  – BOM items (released CDS view)
+    "    I_MAST                – BOM/material/plant link (released CDS view)
+    "    I_PRODUCT             – material master general data (released CDS view)
+    "    I_PRODUCTDESCRIPTION  – material descriptions (released CDS view)
+    "    MARC                  – plant-level data incl. STAWN commodity code
     go_env = cl_osql_test_environment=>create(
                i_dependency_list = VALUE #(
-                 ( 'STPO' )
-                 ( 'STKO' )
-                 ( 'MARA' )
-                 ( 'MARC' )
-                 ( 'MAKT' ) ) ).
+                 ( 'I_BILLOFMATERIALITEM' )
+                 ( 'I_MAST' )
+                 ( 'I_PRODUCT' )
+                 ( 'I_PRODUCTDESCRIPTION' )
+                 ( 'MARC' ) ) ).
   ENDMETHOD.
 
 
@@ -58,237 +81,231 @@ CLASS ztc_tariff_jump_analysis_v2 IMPLEMENTATION.
   ENDMETHOD.
 
 
-  "--------------------------------------------------------------------
-  " Helper: insert a minimal, self-consistent set of BOM test records.
-  "  fp_matnr  – finished-product material number
-  "  co_matnr  – component material number
-  "  fp_steuc  – commodity code of the finished product (MARC.STEUC)
-  "  co_steuc  – commodity code of the component      (MARC.STEUC)
-  "--------------------------------------------------------------------
-  METHOD _insert_bom_record ##NEEDED.
-    " (local helper – defined in locals_imp include)
+  METHOD _insert_bom_scenario.
+    "--------------------------------------------------------------------
+    " I_BillOfMaterialItem – one stock item (category 'L') per BOM.
+    " BillOfMaterialItemNodeNumber is the unique node key used by the
+    " analysis view as a key field.
+    "--------------------------------------------------------------------
+    DATA lt_bom_items TYPE STANDARD TABLE OF i_billofmaterialitem
+                      WITH DEFAULT KEY.
+    lt_bom_items = VALUE #(
+      ( BillOfMaterial              = iv_bom_id
+        BillOfMaterialCategory      = 'M'
+        BillOfMaterialItemNodeNumber = '0000000001'
+        BillOfMaterialItemNumber    = '0010'
+        BillOfMaterialComponent     = iv_comp_mat
+        BillOfMaterialItemCategory  = 'L'       " required by WHERE clause
+        BillOfMaterialItemQuantity  = '1'
+        BillOfMaterialItemUnit      = 'PC'
+        ValidityStartDate           = '19000101'
+        ValidityEndDate             = '99991231' ) ).
+    go_env->insert_test_data( lt_bom_items ).
+
+    "--------------------------------------------------------------------
+    " I_Mast – links BOM to finished product + plant.
+    " BillOfMaterialVariantUsage = '1' is required by the WHERE clause.
+    "--------------------------------------------------------------------
+    DATA lt_mast TYPE STANDARD TABLE OF i_mast WITH DEFAULT KEY.
+    lt_mast = VALUE #(
+      ( BillOfMaterial             = iv_bom_id
+        BillOfMaterialCategory     = 'M'
+        Material                   = iv_fp_mat
+        Plant                      = iv_plant
+        BillOfMaterialVariantUsage = '1' ) ).  " required by WHERE clause
+    go_env->insert_test_data( lt_mast ).
+
+    "--------------------------------------------------------------------
+    " I_Product – material master for FP and component.
+    "--------------------------------------------------------------------
+    DATA lt_products TYPE STANDARD TABLE OF i_product WITH DEFAULT KEY.
+    lt_products = VALUE #(
+      ( Product      = iv_fp_mat   ProductType = 'FERT' ProductGroup = 'A001' )
+      ( Product      = iv_comp_mat ProductType = 'ROH'  ProductGroup = 'B001' ) ).
+    go_env->insert_test_data( lt_products ).
+
+    "--------------------------------------------------------------------
+    " I_ProductDescription – FP description (inner join: required).
+    "                        Component description (left outer: optional).
+    "--------------------------------------------------------------------
+    DATA lt_desc TYPE STANDARD TABLE OF i_productdescription WITH DEFAULT KEY.
+    lt_desc = VALUE #(
+      ( Product = iv_fp_mat   Language = 'E'
+        ProductDescription = 'Finished Product Test' )
+      ( Product = iv_comp_mat Language = 'E'
+        ProductDescription = 'Component Test' ) ).
+    go_env->insert_test_data( lt_desc ).
+
+    "--------------------------------------------------------------------
+    " MARC – plant data with commodity code (STAWN, CHAR 9).
+    " Both FP and component use inner join, so both rows are required;
+    " passing '' for stawn simulates a material without a commodity code.
+    "--------------------------------------------------------------------
+    DATA lt_marc TYPE STANDARD TABLE OF marc WITH DEFAULT KEY.
+    lt_marc = VALUE #(
+      ( matnr = iv_fp_mat   werks = iv_plant stawn = iv_fp_stawn )
+      ( matnr = iv_comp_mat werks = iv_plant stawn = iv_co_stawn ) ).
+    go_env->insert_test_data( lt_marc ).
   ENDMETHOD.
 
 
   METHOD test_no_jump_at_heading.
-    " --- Arrange -----------------------------------------------------------
-    " Same heading: 8471 (first 4 chars of each commodity code are identical)
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000001' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_A' werks = '1000' stlan = '1' ) ) ).
+    " Same heading: 8471 (first 4 chars identical) → both flags must be ''.
+    " STAWN is CHAR 9, e.g. '847130000' (HS: 8471.30) and '847180000' (HS: 8471.80).
+    _insert_bom_scenario(
+      iv_bom_id   = '00000001'
+      iv_fp_mat   = 'FP_MAT_A'
+      iv_comp_mat = 'CO_MAT_A'
+      iv_plant    = '1000'
+      iv_fp_stawn = '847130000'
+      iv_co_stawn = '847180000' ).   " heading: 8471 = 8471 → no jump
 
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000001' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_A'
-        menge = '1' meins = 'PC' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_A'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_A' mtart = 'ROH'  matkl = 'B001' ) ) ).
-
-    go_env->insert_test_data( VALUE marc_tab(
-      ( matnr = 'FP_MATERIAL_A'   werks = '1000' steuc = '8471300000' )
-      ( matnr = 'COMP_MATERIAL_A' werks = '1000' steuc = '8471800000' ) ) ).
-    " Both start with '8471' → same heading, no jump expected.
-
-    " --- Act ---------------------------------------------------------------
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_A'
+      WHERE FinishedProduct = 'FP_MAT_A'
         AND Plant            = '1000'
       INTO @DATA(ls_result).
 
-    " --- Assert ------------------------------------------------------------
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatheading
       exp = ''
-      msg = 'Expected no tariff jump at heading level' ).
-
+      msg = 'Same heading 8471: no heading jump expected' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatchapter
       exp = ''
-      msg = 'Expected no tariff jump at chapter level' ).
+      msg = 'Same chapter 84: no chapter jump expected' ).
   ENDMETHOD.
 
 
   METHOD test_jump_at_heading.
-    " --- Arrange -----------------------------------------------------------
-    " Different headings: 8471 vs 8473 → jump at heading, same chapter (84)
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000002' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_B' werks = '1000' stlan = '1' ) ) ).
+    " Different headings (8471 vs 8473), same chapter (84).
+    " → TariffJumpAtHeading = 'X', TariffJumpAtChapter = ''.
+    _insert_bom_scenario(
+      iv_bom_id   = '00000002'
+      iv_fp_mat   = 'FP_MAT_B'
+      iv_comp_mat = 'CO_MAT_B'
+      iv_plant    = '1000'
+      iv_fp_stawn = '847130000'
+      iv_co_stawn = '847330000' ).   " FP: 8471, Comp: 8473, both chapter 84
 
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000002' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_B'
-        menge = '2' meins = 'PC' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_B'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_B' mtart = 'ROH'  matkl = 'B001' ) ) ).
-
-    go_env->insert_test_data( VALUE marc_tab(
-      ( matnr = 'FP_MATERIAL_B'   werks = '1000' steuc = '8471300000' )
-      ( matnr = 'COMP_MATERIAL_B' werks = '1000' steuc = '8473300000' ) ) ).
-    " FP heading = 8471, Comp heading = 8473 → jump. Both chapter 84 → no chapter jump.
-
-    " --- Act ---------------------------------------------------------------
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_B'
+      WHERE FinishedProduct = 'FP_MAT_B'
         AND Plant            = '1000'
       INTO @DATA(ls_result).
 
-    " --- Assert ------------------------------------------------------------
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatheading
       exp = 'X'
-      msg = 'Expected tariff jump flag X at heading level' ).
-
+      msg = 'Different headings 8471/8473: heading jump expected' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatchapter
       exp = ''
-      msg = 'Expected no tariff jump at chapter level (same chapter 84)' ).
+      msg = 'Same chapter 84: no chapter jump expected' ).
   ENDMETHOD.
 
 
   METHOD test_no_jump_at_chapter.
-    " Same chapter AND same heading → both flags should be empty.
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000003' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_C' werks = '1000' stlan = '1' ) ) ).
-
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000003' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_C'
-        menge = '1' meins = 'EA' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_C'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_C' mtart = 'ROH'  matkl = 'B001' ) ) ).
-
-    go_env->insert_test_data( VALUE marc_tab(
-      ( matnr = 'FP_MATERIAL_C'   werks = '1000' steuc = '3926900000' )
-      ( matnr = 'COMP_MATERIAL_C' werks = '1000' steuc = '3926100000' ) ) ).
-    " Both chapter 39, both heading 3926 → no jump at either level.
+    " Same heading AND chapter (3926 / 39) → both flags must be ''.
+    _insert_bom_scenario(
+      iv_bom_id   = '00000003'
+      iv_fp_mat   = 'FP_MAT_C'
+      iv_comp_mat = 'CO_MAT_C'
+      iv_plant    = '1000'
+      iv_fp_stawn = '392690000'
+      iv_co_stawn = '392610000' ).   " both heading 3926, chapter 39
 
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_C'
+      WHERE FinishedProduct = 'FP_MAT_C'
         AND Plant            = '1000'
       INTO @DATA(ls_result).
 
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatheading
       exp = ''
-      msg = 'No jump at heading expected' ).
+      msg = 'Same heading 3926: no heading jump expected' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatchapter
       exp = ''
-      msg = 'No jump at chapter expected' ).
+      msg = 'Same chapter 39: no chapter jump expected' ).
   ENDMETHOD.
 
 
   METHOD test_jump_at_chapter.
-    " Different chapters → chapter jump (and heading jump) must both be flagged.
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000004' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_D' werks = '1000' stlan = '1' ) ) ).
-
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000004' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_D'
-        menge = '1' meins = 'KG' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_D'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_D' mtart = 'ROH'  matkl = 'B001' ) ) ).
-
-    go_env->insert_test_data( VALUE marc_tab(
-      ( matnr = 'FP_MATERIAL_D'   werks = '1000' steuc = '6204310000' )
-      ( matnr = 'COMP_MATERIAL_D' werks = '1000' steuc = '5209100000' ) ) ).
-    " FP chapter 62, Comp chapter 52 → both chapter jump AND heading jump.
+    " Different chapters (62 vs 52) → both heading and chapter flags must be 'X'.
+    _insert_bom_scenario(
+      iv_bom_id   = '00000004'
+      iv_fp_mat   = 'FP_MAT_D'
+      iv_comp_mat = 'CO_MAT_D'
+      iv_plant    = '1000'
+      iv_fp_stawn = '620431000'
+      iv_co_stawn = '520910000' ).   " FP chapter 62, Comp chapter 52
 
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_D'
+      WHERE FinishedProduct = 'FP_MAT_D'
         AND Plant            = '1000'
       INTO @DATA(ls_result).
 
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatheading
       exp = 'X'
-      msg = 'Expected heading jump flag X' ).
+      msg = 'Different headings 6204/5209: heading jump expected' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatchapter
-      exp = 'X'
-      msg = 'Expected chapter jump flag X' ).
+      exp = ''
+      msg = 'Different chapters 62/52: chapter jump expected' ).
   ENDMETHOD.
 
 
   METHOD test_empty_commodity_codes.
-    " Both commodity codes blank → both substring results '' = '' → no jump.
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000005' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_E' werks = '1000' stlan = '1' ) ) ).
-
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000005' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_E'
-        menge = '1' meins = 'PC' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_E'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_E' mtart = 'ROH'  matkl = 'B001' ) ) ).
-    " No MARC rows → LEFT OUTER JOIN → STEUC will be NULL/initial → substrings equal.
+    " Both STAWN = '' → substring(1,4) = '' = '' → no jump at either level.
+    " NOTE: _FPPlant and _CompPlant are inner joins in Z_I_TariffJumpBase_V2,
+    " so MARC rows MUST exist (with blank stawn) for the BOM item to appear.
+    _insert_bom_scenario(
+      iv_bom_id   = '00000005'
+      iv_fp_mat   = 'FP_MAT_E'
+      iv_comp_mat = 'CO_MAT_E'
+      iv_plant    = '1000'
+      iv_fp_stawn = ''             " blank → FPTariffHeading / Chapter = ''
+      iv_co_stawn = '' ).          " blank → CompTariffHeading / Chapter = ''
 
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_E'
+      WHERE FinishedProduct = 'FP_MAT_E'
         AND Plant            = '1000'
       INTO @DATA(ls_result).
 
+    cl_abap_unit_assert=>assert_subrc(
+      act = sy-subrc
+      exp = 0
+      msg = 'Row must be found even when STAWN is blank (MARC rows exist)' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatheading
       exp = ''
-      msg = 'Empty commodity codes: no heading jump expected' ).
+      msg = 'Blank STAWN: no heading jump expected' ).
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-tariffjumpatchapter
       exp = ''
-      msg = 'Empty commodity codes: no chapter jump expected' ).
+      msg = 'Blank STAWN: no chapter jump expected' ).
   ENDMETHOD.
 
 
   METHOD test_heading_jump_no_chapter_jump.
     " Same chapter (84) but different headings (8471 vs 8473).
-    " → TariffJumpAtHeading = 'X', TariffJumpAtChapter = ''.
-    " (Duplicate of test_jump_at_heading; kept as explicit regression guard.)
-    go_env->insert_test_data( VALUE stko_tab(
-      ( stlnr = '0000000006' stlal = '01' stlty = 'M'
-        matnr = 'FP_MATERIAL_F' werks = '2000' stlan = '1' ) ) ).
-
-    go_env->insert_test_data( VALUE stpo_tab(
-      ( stlnr = '0000000006' stlal = '01'
-        posnr = '0010' idnrk = 'COMP_MATERIAL_F'
-        menge = '1' meins = 'PC' postp = 'L'
-        datuv = '19000101' datub = '99991231' ) ) ).
-
-    go_env->insert_test_data( VALUE mara_tab(
-      ( matnr = 'FP_MATERIAL_F'   mtart = 'FERT' matkl = 'A001' )
-      ( matnr = 'COMP_MATERIAL_F' mtart = 'ROH'  matkl = 'B001' ) ) ).
-
-    go_env->insert_test_data( VALUE marc_tab(
-      ( matnr = 'FP_MATERIAL_F'   werks = '2000' steuc = '8471300000' )
-      ( matnr = 'COMP_MATERIAL_F' werks = '2000' steuc = '8473300000' ) ) ).
+    " Explicit regression guard: heading 'X', chapter ''.
+    _insert_bom_scenario(
+      iv_bom_id   = '00000006'
+      iv_fp_mat   = 'FP_MAT_F'
+      iv_comp_mat = 'CO_MAT_F'
+      iv_plant    = '2000'
+      iv_fp_stawn = '847130000'
+      iv_co_stawn = '847330000' ).
 
     SELECT SINGLE TariffJumpAtHeading, TariffJumpAtChapter
       FROM Z_I_TariffJumpAnalysis_V2
-      WHERE FinishedProduct = 'FP_MATERIAL_F'
+      WHERE FinishedProduct = 'FP_MAT_F'
         AND Plant            = '2000'
       INTO @DATA(ls_result).
 
