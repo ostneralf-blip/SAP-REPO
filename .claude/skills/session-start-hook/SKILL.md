@@ -59,7 +59,10 @@ Make a todo list for all the tasks in this workflow and work on them one after a
 ### 1. Analyze Dependencies
 
 Find dependency manifests and analyze them. Examples:
-- `package.json` / `package-lock.json` → npm
+- `package.json` / `package-lock.json` → npm (also used for UI5/Fiori projects)
+- `ui5.yaml` → UI5 tooling (`npm install -g @ui5/cli`)
+- `mta.yaml` / `mta.yaml` → SAP MTA build tool (`npm install -g mbt`)
+- `.abapgit.xml` → abapGit project (no install needed, synced via ABAP system)
 - `pyproject.toml` / `requirements.txt` → pip/Poetry
 - `Cargo.toml` → cargo
 - `go.mod` → go
